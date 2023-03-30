@@ -435,6 +435,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     try:
       self.unet_model = torch.load(modelFullpath)
+      logging.info(self.unet_model)
       logging.info("Model loaded from file: {}".format(modelFullpath))
       settings = qt.QSettings()
       settings.setValue(self.LAST_AI_MODEL_PATH_SETTING, modelFullpath)
@@ -445,7 +446,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
   def setupProcess(self):
     parameterNode = self.getParameterNode()
-    scriptFolder = slicer.modules.UltraSeg.path.replace("UltraSeg.py", "")
+    scriptFolder = slicer.modules.ultraseg.path.replace("UltraSeg.py", "")
     scriptPath = os.path.join(scriptFolder, "Resources", "ProcessScripts", "LivePredictions.slicer.py")
 
     inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
@@ -485,18 +486,18 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       input_array = slicer.util.array(inputImageNode.GetID())  # (Z, F, M)
       input_array = input_array[0, :, :]  # (F, M)
 
-      for layer in self.unet_model.layers:
-        if 'input' in layer.name:
-          model_input_shape = layer.input_shape[0]
+      # for layer in self.unet_model.layers:
+      #   if 'input' in layer.name:
+      #     model_input_shape = layer.input_shape[0]
 
-      self.slicer_to_model_scaling = (
-        model_input_shape[1] / input_array.shape[0],  # F direction in image
-        model_input_shape[2] / input_array.shape[1],  # M direction in image
-      )
-      self.model_to_slicer_scaling = (
-        input_array.shape[0] / model_input_shape[1],
-        input_array.shape[1] / model_input_shape[2],
-      )
+      # self.slicer_to_model_scaling = (
+      #   model_input_shape[1] / input_array.shape[0],  # F direction in image
+      #   model_input_shape[2] / input_array.shape[1],  # M direction in image
+      # )
+      # self.model_to_slicer_scaling = (
+      #   input_array.shape[0] / model_input_shape[1],
+      #   input_array.shape[1] / model_input_shape[2],
+      # )
 
       # Start observing input image
 
@@ -560,8 +561,10 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     try:
       slicer.app.pauseRender()
       output_array = self.livePredictionProcess.output['prediction']
+      logging.debug(output_array.shape)
       predictionVolumeNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
-      slicer.util.updateVolumeFromArray(predictionVolumeNode, output_array.astype(np.uint8)[np.newaxis, ...])
+      # slicer.util.updateVolumeFromArray(predictionVolumeNode, output_array.astype(np.uint8)[np.newaxis, ...])
+      slicer.util.updateVolumeFromArray(predictionVolumeNode, output_array)
       outputTransformNode = parameterNode.GetNodeReference(self.OUTPUT_TRANSFORM)
       if outputTransformNode is not None:
         slicer.util.updateTransformMatrixFromArray(outputTransformNode, self.livePredictionProcess.output['transform'])
@@ -616,7 +619,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
     input_array = slicer.util.array(inputImageNode.GetID())
     self.livePredictionProcess.volume = input_array
-
+    logging.debug(input_array.shape)
     imageTransformNode = inputImageNode.GetParentTransformNode()
     if imageTransformNode is not None:
       inputTransformMatrix = vtk.vtkMatrix4x4()
@@ -641,8 +644,8 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     resized_input_array = np.array(  # np.array will be (F, M) again, but resize happens in (M, F) axis order
       input_image.resize(
         (
-          int(input_image.width * self.slicer_to_model_scaling[1]),  # M direction (width on US machine)
-          int(input_image.height * self.slicer_to_model_scaling[0]),  # F direction (height on US machine)
+          512, #int(input_image.width * self.slicer_to_model_scaling[1]),  # M direction (width on US machine)
+          512, #int(input_image.height * self.slicer_to_model_scaling[0]),  # F direction (height on US machine)
         ),
         resample=Image.BILINEAR
       )
@@ -651,8 +654,8 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     resized_input_array = resized_input_array / resized_input_array.max()  # Scaling intensity to 0-1
     resized_input_array = np.expand_dims(resized_input_array, axis=0)  # Add Batch dimension
     resized_input_array = np.expand_dims(resized_input_array, axis=3)
-
-    y = self.unet_model.predict(resized_input_array)
+    
+    y = self.unet_model(resized_input_array)
 
     output_array = y[0, :, :, 1]  # Remove batch dimension (F, M)
     output_array = np.flip(output_array, axis=0)  # Flip back to match input sound direction
