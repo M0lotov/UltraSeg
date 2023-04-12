@@ -10,8 +10,9 @@ import vtk, qt, ctk, slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import torch
-
-
+import torchvision.transforms
+from Resources.unet import UNet
+import torch.nn.functional as F
 #
 # UltraSeg
 #
@@ -26,12 +27,10 @@ class UltraSeg(ScriptedLoadableModule):
     self.parent.title = "UltraSeg"
     self.parent.categories = ["Ultrasound"]
     self.parent.dependencies = []  # TODO: add here list of module names that this module requires
-    self.parent.contributors = ["Tamas Ungi (Queen's University), Zac Baum (UCL)"]
-    self.parent.helpText = """Computes ultrasound segmentation prediction using UNet in real time."""
-    self.parent.helpText += self.getDefaultModuleDocumentationLink()  # TODO: verify that the default URL is correct or change it to the actual documentation
+    self.parent.contributors = ["Yanlin Chen"]
+    self.parent.helpText = """Ultrasound segmentation using UNet in real time."""
     self.parent.acknowledgementText = """
-This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc.
-and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
+SUSTech CS 330 - Multimedia Information Processing Course Project
 """
 
 #
@@ -291,6 +290,12 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     self.predictionPaused = False
 
+    self.vesselLabelNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', 'Vessel')
+    self.nerveLabelNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', 'Nerve')
+    self.segmentationNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode', 'UltraSoundSegmentation')
+    self.segmentationNode.GetSegmentation().AddEmptySegment('nerve')
+    self.segmentationNode.GetSegmentation().AddEmptySegment('vessel')
+
   def setDefaultParameters(self, parameterNode):
     if not parameterNode.GetParameter(self.OUTPUT_FPS):
       parameterNode.SetParameter(self.OUTPUT_FPS, "0.0")
@@ -362,7 +367,11 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     parameterNode.SetParameter(self.AI_MODEL_FULLPATH, modelFullpath)
 
     try:
-      self.unet_model = torch.load(modelFullpath)
+      model = UNet(n_channels=1, n_classes=3).cuda()
+      checkpoint = torch.load(modelFullpath)
+      model.load_state_dict(checkpoint)
+      model.eval()
+      self.unet_model = model
       logging.info(self.unet_model)
       logging.info("Model loaded from file: {}".format(modelFullpath))
       settings = qt.QSettings()
@@ -393,9 +402,9 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       self.inputModifiedObserverTag = inputImageNode.AddObserver(slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent,
                                                                  self.onInputNodeModified)
       self.onInputNodeModified(None, None)  # Compute prediction for current image instead of waiting for an update
-      slicer.app.layoutManager().sliceWidget('Yellow').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(outputImageNode.GetID())
-      slicer.app.layoutManager().sliceWidget("Yellow").mrmlSliceNode().SetOrientation('Axial')
-      slicer.app.layoutManager().sliceWidget("Yellow").sliceController().fitSliceToBackground()
+      # slicer.app.layoutManager().sliceWidget('Yellow').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(outputImageNode.GetID())
+      # slicer.app.layoutManager().sliceWidget("Yellow").mrmlSliceNode().SetOrientation('Axial')
+      # slicer.app.layoutManager().sliceWidget("Yellow").sliceController().fitSliceToBackground()
 
     else:
       logging.info("Stopping live segmentation")
@@ -448,7 +457,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     parameterNode = self.getParameterNode()
     inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
     input_array = slicer.util.array(inputImageNode.GetID())
-    logging.debug(input_array.shape)
+    # logging.debug(input_array.dtype)
     # input_array axis directions (Z, F, M):
     # 1: out of plane = Z
     # 2: sound direction = F
@@ -468,8 +477,8 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # resized_input_array = resized_input_array / resized_input_array.max()  # Scaling intensity to 0-1
     # resized_input_array = np.expand_dims(resized_input_array, axis=0)  # Add Batch dimension
     # resized_input_array = np.expand_dims(resized_input_array, axis=3)
-    
-    # y = self.unet_model(resized_input_array)
+    input_tensor = torchvision.transforms.Compose([torchvision.transforms.Resize((512,512)), torchvision.transforms.ToTensor()])(Image.fromarray(input_array[0,:,:])).unsqueeze(0).cuda()
+    output_tensor = self.unet_model(input_tensor)
 
     # output_array = y[0, :, :, 1]  # Remove batch dimension (F, M)
     # output_array = np.flip(output_array, axis=0)  # Flip back to match input sound direction
@@ -491,10 +500,41 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # )
     # upscaled_output_array = upscaled_output_array * 255
     # upscaled_output_array = np.clip(upscaled_output_array, 0, 255)
+    # logging.debug(torch.unique(torch.argmax(output_tensor, dim=1)))
+    output_tensor[:,1:,...][output_tensor[:,1:,...]<0.99] = 0
+    output_cls = torch.argmax(output_tensor, dim=1).cpu().numpy().astype(np.uint8)
+    output_cls = np.asarray(Image.fromarray(output_cls[0,:,:]).resize((input_array.shape[2], input_array.shape[1]), resample=Image.BILINEAR))[np.newaxis,...]
+    # logging.debug(output_cls.shape)
+    output_array = input_array.copy()
+    output_array[output_cls==0] = 0
+    nerve_mask = (output_cls==1).astype(np.uint8)
+    vessel_mask = (output_cls==2).astype(np.uint8)
+    # logging.debug(np.unique(input_array))
+    # logging.debug('out')
+    # logging.debug(np.unique(output_array))
+    # if 127 in output_array:
+    #   logging.debug(np.unique(output_array))
+    #   Image.fromarray(output_array[0,:,:]).save('D:\\downloads\\test.png')
+    # output = Image.fromarray(output_array[0,:,:]).convert('L')
+    # logging.debug(output.getcolors())
+    # output_array[output_array==1] = 127
+    # output_array[output_array==2] = 255
+    # logging.debug(np.unique(output_array))
 
-    outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+
+    # VolumeIJKToRAS = vtk.vtkMatrix4x4()
+    # inputImageNode.GetIJKToRASMatrix(VolumeIJKToRAS)
+    # self.vesselLabelNode.SetIJKToRASMatrix(VolumeIJKToRAS)
+    # self.nerveLabelNode.SetIJKToRASMatrix(VolumeIJKToRAS)  
+
+    # slicer.util.updateVolumeFromArray(self.nerveLabelNode, nerve_mask)
+    # slicer.util.updateVolumeFromArray(self.vesselLabelNode, vessel_mask)
+    slicer.util.updateSegmentBinaryLabelmapFromArray(nerve_mask, self.segmentationNode, self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('nerve'), inputImageNode)
+    slicer.util.updateSegmentBinaryLabelmapFromArray(vessel_mask, self.segmentationNode, self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('vessel'), inputImageNode)
+    # self.nerveSegNode.CreateClosedSurfaceRepresentation()
+    # outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
     # slicer.util.updateVolumeFromArray(outputImageNode, upscaled_output_array.astype(np.uint8)[np.newaxis, ...])
-    slicer.util.updateVolumeFromArray(outputImageNode, input_array)
+    # slicer.util.updateVolumeFromArray(outputImageNode, output_array)
     # Update output transform, just to be compatible with running separate process
 
     # inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
