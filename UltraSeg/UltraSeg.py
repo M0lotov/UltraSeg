@@ -89,9 +89,13 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
       self.ui.modelPathLineEdit.setCurrentPath(lastModelPath)
     self.ui.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onInputImageSelected)
     self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputImageSelected)
-    # self.ui.outputTransformComboBox.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputTransformSelected)
+    self.ui.outputTransformComboBox.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputTransformSelected)
+    self.ui.processCheckBox.connect("toggled(bool)", self.onProcessToggled)
 
     self.ui.applyButton.connect('toggled(bool)', self.onApplyButton)
+    self.ui.reconButton.connect('clicked(bool)', self.onReconButton)
+    self.ui.startLiveReconButton.connect('clicked(bool)', self.onStartReconButton)
+    self.ui.stopLiveReconButton.connect('clicked(bool)', self.onPauseReconButton)
 
     # Initial GUI update
     self.updateGUIFromParameterNode()
@@ -116,9 +120,11 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
   def onOutputImageSelected(self, selectedNode):
     self.logic.setOutputImage(selectedNode)
 
-  # def onOutputTransformSelected(self, selectedNode):
-  #   self.logic.setOutputTransform(selectedNode)
+  def onOutputTransformSelected(self, selectedNode):
+    self.logic.setOutputTransform(selectedNode)
 
+  def onProcessToggled(self, checked):
+    self._parameterNode.SetParameter(self.logic.USE_SEPARATE_PROCESS, "True" if checked else "False")
 
   def onModelSelected(self, modelFullname):
     self.logic.setModelPath(modelFullname)
@@ -172,8 +178,9 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     self.ui.inputSelector.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.INPUT_IMAGE))
     self.ui.outputSelector.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.OUTPUT_IMAGE))
-    # self.ui.outputTransformComboBox.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.OUTPUT_TRANSFORM))
+    self.ui.outputTransformComboBox.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.OUTPUT_TRANSFORM))
 
+    # self.ui.processCheckBox.checked = (self._parameterNode.GetParameter(self.logic.USE_SEPARATE_PROCESS).lower() == "true")
     self.ui.applyButton.checked = self.logic.getPredictionActive()
 
     # Update buttons states and tooltips
@@ -199,10 +206,18 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     else:
       self.ui.feedbackLabel.text = "Prediction stopped"
 
+  def onReconButton(self):
+    """
+    Run processing when user clicks "Apply" button.
+    """
+    # self.logic.reconstructVolume()
+    self.logic.reconstructLive()
+
   def onApplyButton(self, toggled):
     """
     Run processing when user clicks "Apply" button.
     """
+    # slicer.util.errorDisplay("onReconButton")
     self.inputImageNode = self.ui.inputSelector.currentNode()
     if self.inputImageNode is None:
       self.ui.feedbackLabel.text = "Input image not selected!"
@@ -228,16 +243,17 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     try:
       if toggled:
+        self.ui.processCheckBox.enabled = False
         self.ui.inputSelector.enabled = False
         self.ui.outputSelector.enabled = False
-        # self.ui.outputTransformComboBox.enabled = False
+        self.ui.outputTransformComboBox.enabled = False
         self.addObserver(self.outputImageNode, slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent, self.onOutputModified)
         self.ui.feedbackLabel.text = "Prediction starting"
       else:
         self.removeObserver(self.outputImageNode, slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent, self.onOutputModified)
         self.ui.inputSelector.enabled = True
         self.ui.outputSelector.enabled = True
-        # self.ui.outputTransformComboBox.enabled = True
+        self.ui.outputTransformComboBox.enabled = True
         self.ui.feedbackLabel.text = "Prediction stopped"
 
       self.logic.setRealTimePrediction(toggled)
@@ -246,7 +262,11 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
       import traceback
       traceback.print_exc()
 
+  def onStartReconButton(self):
+    self.logic.startReconstructiveLive()
 
+  def onPauseReconButton(self):
+    self.logic.pauseReconstructiveLive()
 
 #
 # UltraSegLogic
@@ -264,7 +284,8 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
   INPUT_IMAGE = "InputImage"
   OUTPUT_IMAGE = "OutputImage"
-  # OUTPUT_TRANSFORM = "OutputTransform"
+  RECONSTRUCT = "Reconstruct"
+  OUTPUT_TRANSFORM = "OutputTransform"
   OUTPUT_FPS = "OutputFps"
   PREDICTION_ACTIVE = "PredictionActive"
   WAIT_FOR_NODE = "WaitForNode"  # Experimental idea: drop predictions until e.g. volume reconstruction output is updated
@@ -295,6 +316,9 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     self.segmentationNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode', 'UltraSoundSegmentation')
     self.segmentationNode.GetSegmentation().AddEmptySegment('nerve')
     self.segmentationNode.GetSegmentation().AddEmptySegment('vessel')
+
+    # self.volumeReconstructionNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLVolumeReconstructionNode', 'UltraSoundVolumeReconstruction')
+    self.volumeReconstructionNode = None
 
   def setDefaultParameters(self, parameterNode):
     if not parameterNode.GetParameter(self.OUTPUT_FPS):
@@ -347,12 +371,12 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       return
     paramterNode.SetNodeReferenceID(self.OUTPUT_IMAGE, outputImageNode.GetID())
 
-  # def setOutputTransform(self, selectedNode):
-  #   parameterNode = self.getParameterNode()
-  #   if selectedNode is None:
-  #     parameterNode.SetNodeReferenceID(self.OUTPUT_TRANSFORM, None)
-  #     return
-  #   parameterNode.SetNodeReferenceID(self.OUTPUT_TRANSFORM, selectedNode.GetID())
+  def setOutputTransform(self, selectedNode):
+    parameterNode = self.getParameterNode()
+    if selectedNode is None:
+      parameterNode.SetNodeReferenceID(self.OUTPUT_TRANSFORM, None)
+      return
+    parameterNode.SetNodeReferenceID(self.OUTPUT_TRANSFORM, selectedNode.GetID())
 
   def setModelPath(self, modelFullpath):
     """
@@ -382,7 +406,6 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
   def setRealTimePrediction(self, toggled):
     inputImageNode = self.getParameterNode().GetNodeReference(self.INPUT_IMAGE)
-    outputImageNode = self.getParameterNode().GetNodeReference(self.OUTPUT_IMAGE)
     if inputImageNode is None:
       logging.error("Cannot start live prediction, input image not specified")
       return
@@ -452,6 +475,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       return
 
     self.updatePrecition()
+    # 
 
   def updatePrecition(self):
     parameterNode = self.getParameterNode()
@@ -501,7 +525,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # upscaled_output_array = upscaled_output_array * 255
     # upscaled_output_array = np.clip(upscaled_output_array, 0, 255)
     # logging.debug(torch.unique(torch.argmax(output_tensor, dim=1)))
-    output_tensor[:,1:,...][output_tensor[:,1:,...]<0.99] = 0
+    output_tensor[:,1:,...][output_tensor[:,1:,...]<0.999] = 0
     output_cls = torch.argmax(output_tensor, dim=1).cpu().numpy().astype(np.uint8)
     output_cls = np.asarray(Image.fromarray(output_cls[0,:,:]).resize((input_array.shape[2], input_array.shape[1]), resample=Image.BILINEAR))[np.newaxis,...]
     # logging.debug(output_cls.shape)
@@ -509,6 +533,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     output_array[output_cls==0] = 0
     nerve_mask = (output_cls==1).astype(np.uint8)
     vessel_mask = (output_cls==2).astype(np.uint8)
+
     # logging.debug(np.unique(input_array))
     # logging.debug('out')
     # logging.debug(np.unique(output_array))
@@ -527,16 +552,24 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # self.vesselLabelNode.SetIJKToRASMatrix(VolumeIJKToRAS)
     # self.nerveLabelNode.SetIJKToRASMatrix(VolumeIJKToRAS)  
 
-    # slicer.util.updateVolumeFromArray(self.nerveLabelNode, nerve_mask)
-    # slicer.util.updateVolumeFromArray(self.vesselLabelNode, vessel_mask)
+  
+    outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+    slicer.util.updateVolumeFromArray(outputImageNode, nerve_mask*255)
+    # slicer.util.updateVolumeFromArray(outputImageNode, vessel_mask* 255)
+
     slicer.util.updateSegmentBinaryLabelmapFromArray(nerve_mask, self.segmentationNode, self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('nerve'), inputImageNode)
     slicer.util.updateSegmentBinaryLabelmapFromArray(vessel_mask, self.segmentationNode, self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('vessel'), inputImageNode)
+
+    # slicer.util.updateVolumeFromArray(self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('nerve'), nerve_mask * 255)
+    # slicer.util.updateVolumeFromArray(self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('vessel'), vessel_mask * 255)
+   
+   
     # self.nerveSegNode.CreateClosedSurfaceRepresentation()
     # outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
     # slicer.util.updateVolumeFromArray(outputImageNode, upscaled_output_array.astype(np.uint8)[np.newaxis, ...])
     # slicer.util.updateVolumeFromArray(outputImageNode, output_array)
+    
     # Update output transform, just to be compatible with running separate process
-
     # inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
     # imageTransformNode = inputImageNode.GetParentTransformNode()
     # outputTransformNode = parameterNode.GetNodeReference(self.OUTPUT_TRANSFORM)
@@ -547,6 +580,139 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     self.updateOutputFps()  # Update FPS data
 
+  def reconstruct(self):
+      outputSpacingMm = 0.2 
+
+      sequenceBrowserNode = slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSequenceBrowserNode')
+
+      NerveSequenceNode = slicer.mrmlScene.GetFirstNodeByName('vtkMRMLSequenceBrowserNode')
+      # Create a sequence browser node for the reconstructed volume sequence
+      NerveSequenceBrowserNode = slicer.mrmlScene.AddNewNodeByClass(
+          'vtkMRMLSequenceBrowserNode', NerveSequenceNode.GetName() + '_browser')
+      NerveSequenceBrowserNode.AddSynchronizedSequenceNode(NerveSequenceNode)
+      slicer.modules.sequences.logic().UpdateAllProxyNodes()  # ensure that proxy node is created
+      NerveSequenceProxyNode = NerveSequenceBrowserNode.GetProxyNode(NerveSequenceNode)
+      slicer.util.setSliceViewerLayers(background=NerveSequenceBrowserNode)
+      slicer.modules.sequences.showSequenceBrowser(NerveSequenceBrowserNode)
+
+      # Make slice view move with the image (just for visualization)
+      driver = slicer.modules.volumereslicedriver.logic()
+      redSliceNode = slicer.util.getFirstNodeByClassByName("vtkMRMLSliceNode", "Red")
+      driver.SetModeForSlice(driver.MODE_TRANSVERSE, redSliceNode)
+      driver.SetDriverForSlice(NerveSequenceProxyNode.GetID(), redSliceNode)
+
+      # Reconstruct
+      volumeReconstructionNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeReconstructionNode")
+      volumeReconstructionNode.SetAndObserveInputSequenceBrowserNode(NerveSequenceBrowserNode)
+      volumeReconstructionNode.SetAndObserveInputVolumeNode(NerveSequenceProxyNode)
+      volumeReconstructionNode.SetOutputSpacing(outputSpacingMm, outputSpacingMm, outputSpacingMm)
+      volumeReconstructionNode.SetFillHoles(True)
+
+      slicer.modules.volumereconstruction.logic().ReconstructVolumeFromSequence(volumeReconstructionNode)
+      # slicer.modules.volumereconstruction.logic().StartLiveVolumeReconstruction(volumeReconstructionNode)
+
+      reconstructedVolume = volumeReconstructionNode.GetOutputVolumeNode()
+      reconstructedVolume.SetName(NerveSequenceBrowserNode.GetName()+"_recon")
+      roiNode = volumeReconstructionNode.GetInputROINode()
+      # Cleanup
+      slicer.mrmlScene.RemoveNode(volumeReconstructionNode)
+      # Show reconstruction result
+      roiNode.SetDisplayVisibility(False)
+      slicer.util.setSliceViewerLayers(background=reconstructedVolume,fit=True)
+
+    # Helper function
+
+  def reconstructVolume(self):
+    # Create sequence browser node
+    # sequenceNode = slicer.mrmlScene.GetFirstNodeByName('Video-Image-Seq')
+
+    # sequenceBrowserNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceBrowserNode', 'TempReconstructionVolumeBrowser')
+    # sequenceBrowserNode.AddSynchronizedSequenceNode(sequenceNode)
+    # slicer.modules.sequences.logic().UpdateAllProxyNodes()  # ensure that proxy node is created
+    
+    # Make slice view move with the image (just for visualization)
+    # driver = slicer.modules.volumereslicedriver.logic()
+    # redSliceNode = slicer.util.getFirstNodeByClassByName("vtkMRMLSliceNode", "Red")
+    # driver.SetModeForSlice(driver.MODE_TRANSVERSE, redSliceNode)
+    # driver.SetDriverForSlice(sequenceNode.GetID(), redSliceNode)
+
+    # Reconstruct
+    sequenceBrowserNode = slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSequenceBrowserNode')
+    # sequenceNode = slice.mrmlScene.GetFirstNodeByName('Recording1-Image')
+
+    parameterNode = self.getParameterNode()
+    sequenceNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+
+    volumeReconstructionNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumeReconstructionNode")
+    volumeReconstructionNode.SetAndObserveInputSequenceBrowserNode(sequenceBrowserNode)
+    proxyNode = sequenceBrowserNode.GetProxyNode(sequenceNode)
+    # proxyNode = sequenceBrowserNode.GetProxyNode(slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSequenceNode'))
+    volumeReconstructionNode.SetAndObserveInputVolumeNode(proxyNode)
+    # volumeReconstructionNode.SetAndObserveInputROINode(roiNode)
+    # volumeReconstructionNode.SetFillHoles(True)
+    slicer.modules.volumereconstruction.logic().ReconstructVolumeFromSequence(volumeReconstructionNode)
+    reconstructedVolume = volumeReconstructionNode.GetOutputVolumeNode()
+    slicer.util.setSliceViewerLayers(background=reconstructedVolume,fit=True)
+    
+    # # Cleanup
+    slicer.mrmlScene.RemoveNode(volumeReconstructionNode)
+    slicer.mrmlScene.RemoveNode(sequenceBrowserNode)
+    # slicer.mrmlScene.RemoveNode(proxyNode)
+    # return reconstructedVolume
+  
+  def reconstructLive(self):
+      # set the input image, ROI, and output volume
+      
+      # output volume
+      self.volumeReconstructionNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLVolumeReconstructionNode', 'UltraSoundVolumeReconstruction')
+      # OutputReconstructionNode = self.volumeReconstructionNode.GetOutputVolumeNode()
+      
+      # sequenceBrowserNode
+      sequenceBrowserNode = slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSequenceBrowserNode')
+
+      # input image
+      PreImageNode = slicer.mrmlScene.GetFirstNodeByName('pre')
+      # intputSequenceNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", "pre_frames")
+      # intputSequenceNode.SetIndexName("frame")
+      # intputSequenceNode.SetIndexUnit("")
+      # intputSequenceNode = slicer.vtkMRMLSliceLayerLogic.SafeDownCast(PreImageNode)
+
+      # ROI
+      outputROINodeRAS = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLAnnotationROINode')
+      slicer.modules.volumereconstruction.logic().CalculateROIFromVolumeSequence(
+          sequenceBrowserNode, PreImageNode, outputROINodeRAS)
+
+      # Reconstruction
+      self.volumeReconstructionNode.SetAndObserveInputVolumeNode(PreImageNode)
+      self.volumeReconstructionNode.SetAndObserveInputROINode(outputROINodeRAS)
+      # volumeReconstructionNode.SetAndObserveOutputVolumeNode(OutputReconstructionNode)
+
+      # slicer.modules.volumereconstruction.logic().StartLiveVolumeReconstruction(volumeReconstructionNode)
+      # print('reconstructing')
+      # slicer.modules.volumereconstruction.logic().StopLiveVolumeReconstruction(volumeReconstructionNode)
+
+  def startReconstructiveLive(self):
+      if self.volumeReconstructionNode is None:
+        return
+      print('startReconstructiveLive')
+      slicer.modules.volumereconstruction.logic().StartLiveVolumeReconstruction(self.volumeReconstructionNode)
+
+  def pauseReconstructiveLive(self):
+      if self.volumeReconstructionNode is None:
+        return
+      print('pauseReconstructiveLive')
+      slicer.modules.volumereconstruction.logic().StopLiveVolumeReconstruction(self.volumeReconstructionNode)
+      self.trans2Obj()
+
+
+  def trans2Obj(self):
+      print('ready to trans to obj and send')
+      outputVilumeNode = self.volumeReconstructionNode.GetOutputVolumeNode()
+
+      segmentationNode = getNode("Segmentation")
+      shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+      exportFolderItemId = shNode.CreateFolderItem(shNode.GetSceneItemID(), "Segments")
+      slicer.modules.segmentations.logic().ExportAllSegmentsToModels(segmentationNode, exportFolderItemId)
 
 #
 # UltraSegTest
