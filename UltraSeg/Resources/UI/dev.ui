@@ -210,6 +210,29 @@
     </widget>
    </item>
    <item>
+    <widget class="QPushButton" name="reconButton">
+     <property name="enabled">
+      <bool>true</bool>
+     </property>
+     <property name="text">
+      <string>Apply reconstruction</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="startLiveReconButton">
+     <property name="text">
+      <string>Start live reconstruction</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="stopLiveReconButton">
+     <property name="text">
+      <string>Pause live reconstruction</string>
+     </property>
+    </widget>
+   </item>   <item>
     <widget class="QLabel" name="feedbackLabel">
      <property name="text">
       <string/>

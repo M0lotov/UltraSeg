@@ -7,7 +7,7 @@ import vtk, qt, slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import torch
-from Resources.unext import UNext
+from Resources.unext import UNext, UNext_S
 from Resources.UtilConnections import UtilConnections
 import torch.backends.cudnn as cudnn
 import cv2
@@ -115,6 +115,10 @@ class devWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # self.ui.applyButton.enabled = False
     # self.ui.embeddingButton.connect('clicked(bool)', self.onEmbeddingButton)
 
+    self.ui.reconButton.connect('clicked(bool)', self.onReconButton)
+    self.ui.startLiveReconButton.connect('clicked(bool)', self.onStartReconButton)
+    self.ui.stopLiveReconButton.connect('clicked(bool)', self.onPauseReconButton)
+
     self.ui.SegmentEditorWidget.setMRMLSegmentEditorNode(slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentEditorNode', 'MySegmentEditor'))
     self.ui.SegmentEditorWidget.setSegmentationNode(slicer.util.getNode('Prompt'))
     # self.ui.SegmentEditorWidget.setActiveEffectByName('Scissors')
@@ -177,6 +181,19 @@ class devWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
   # def onOutputTransformSelected(self, selectedNode):
   #   self.logic.setOutputTransform(selectedNode)
 
+  def onReconButton(self):
+    """
+    Run processing when user clicks "Apply" button.
+    """
+    # self.logic.reconstructVolume()
+    self.logic.reconstructLive()
+
+
+  def onStartReconButton(self):
+    self.logic.startReconstructiveLive()
+
+  def onPauseReconButton(self):
+    self.logic.pauseReconstructiveLive()
 
   def onModelSelected(self, modelFullname):
     self.logic.setModelPath(modelFullname)
@@ -345,6 +362,7 @@ class devLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
   AI_MODEL_FULLPATH = "AiModelFullpath"
   LAST_AI_MODEL_PATH_SETTING = "dev/LastAiModelPath"
   SEQUENCE_BROWSER = 'SequenceBrowser'
+  RECONSTRUCT = "Reconstruct"
 
   def __init__(self):
     ScriptedLoadableModuleLogic.__init__(self)
@@ -358,6 +376,8 @@ class devLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     self.logarithmic_transformation_decimals = 4
 
     self.inputModifiedObserverTag = None
+
+    self.volumeReconstructionNode = None
 
     self.outputLastTime_s = 0
     self.fpsBuffer = np.zeros(5)
@@ -446,7 +466,7 @@ class devLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     try:
       cudnn.benchmark = True
-      model = UNext(num_classes=2).cuda()
+      model = UNext_S(num_classes=2).cuda()
       checkpoint = torch.load(modelFullpath)
       model.load_state_dict(checkpoint)
       model.eval()
@@ -580,7 +600,7 @@ class devLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # slicer.util.updateSegmentBinaryLabelmapFromArray(nerve_mask[::-1, :], segmentationNode, segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('nerve'), inputImageNode)
     # slicer.util.updateSegmentBinaryLabelmapFromArray(vessel_mask[::-1, :], segmentationNode, segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('vessel'), inputImageNode)
 
-    slicer.util.updateVolumeFromArray(outputImageNode, nerve_mask[::-1, :] + vessel_mask[::-1, :])
+    slicer.util.updateVolumeFromArray(outputImageNode, nerve_mask[::-1, :] * 127 + vessel_mask[::-1, :] * 255)
     
     self.updateOutputFps()  # Update FPS data
 
@@ -624,6 +644,50 @@ class devLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     nerve_mask, vessel_mask = output[0], output[1]
     return nerve_mask[::-1,:], vessel_mask[::-1,:]
   
+  def reconstructLive(self):
+      parameterNode = self.getParameterNode()
+      outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+
+      # output volume
+      self.volumeReconstructionNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLVolumeReconstructionNode', 'UltraSoundVolumeReconstruction')
+      # OutputReconstructionNode = self.volumeReconstructionNode.GetOutputVolumeNode()
+
+      # sequenceBrowserNode
+      sequenceBrowserNode = slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSequenceBrowserNode')
+
+      # input image
+      PreImageNode = slicer.mrmlScene.GetFirstNodeByName('pre')
+      # intputSequenceNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", "pre_frames")
+      # intputSequenceNode.SetIndexName("frame")
+      # intputSequenceNode.SetIndexUnit("")
+      # intputSequenceNode = slicer.vtkMRMLSliceLayerLogic.SafeDownCast(PreImageNode)
+
+      # ROI
+      outputROINodeRAS = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLAnnotationROINode')
+      slicer.modules.volumereconstruction.logic().CalculateROIFromVolumeSequence(
+          sequenceBrowserNode, outputImageNode, outputROINodeRAS)
+
+      # Reconstruction
+      self.volumeReconstructionNode.SetAndObserveInputVolumeNode(outputImageNode)
+      self.volumeReconstructionNode.SetAndObserveInputROINode(outputROINodeRAS)
+      # volumeReconstructionNode.SetAndObserveOutputVolumeNode(OutputReconstructionNode)
+
+      # slicer.modules.volumereconstruction.logic().StartLiveVolumeReconstruction(volumeReconstructionNode)
+      # print('reconstructing')
+      # slicer.modules.volumereconstruction.logic().StopLiveVolumeReconstruction(volumeReconstructionNode)
+
+  def startReconstructiveLive(self):
+      if self.volumeReconstructionNode is None:
+        return
+      print('startReconstructiveLive')
+      slicer.modules.volumereconstruction.logic().StartLiveVolumeReconstruction(self.volumeReconstructionNode)
+
+  def pauseReconstructiveLive(self):
+      if self.volumeReconstructionNode is None:
+        return
+      print('pauseReconstructiveLive')
+      slicer.modules.volumereconstruction.logic().StopLiveVolumeReconstruction(self.volumeReconstructionNode)
+      # self.trans2Obj()
 
 def find_max_region(mask_sel):
     mask_sel = np.ascontiguousarray(mask_sel)
