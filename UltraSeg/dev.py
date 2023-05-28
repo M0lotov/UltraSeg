@@ -1,30 +1,29 @@
 import os
-import unittest
 import logging
 import numpy as np
-import pickle
 import time
-from PIL import Image
-import vtk, qt, ctk, slicer
+import vtk, qt, slicer
 
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import torch
-import torchvision.transforms
-from Resources.unet import UNet
-import torch.nn.functional as F
+from Resources.unext import UNext
+from Resources.UtilConnections import UtilConnections
+import torch.backends.cudnn as cudnn
+import cv2
+
 #
-# UltraSeg
+# dev
 #
 
-class UltraSeg(ScriptedLoadableModule):
+class dev(ScriptedLoadableModule):
   """Uses ScriptedLoadableModule base class, available at:
   https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
   """
 
   def __init__(self, parent):
     ScriptedLoadableModule.__init__(self, parent)
-    self.parent.title = "UltraSeg"
+    self.parent.title = "dev"
     self.parent.categories = ["Ultrasound"]
     self.parent.dependencies = []  # TODO: add here list of module names that this module requires
     self.parent.contributors = ["Yanlin Chen"]
@@ -34,10 +33,10 @@ SUSTech CS 330 - Multimedia Information Processing Course Project
 """
 
 #
-# UltraSegWidget
+# devWidget
 #
 
-class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+class devWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
   """Uses ScriptedLoadableModuleWidget base class, available at:
   https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
   """
@@ -65,7 +64,7 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     # Load widget from .ui file (created by Qt Designer)
 
-    uiWidget = slicer.util.loadUI(self.resourcePath('UI/UltraSeg.ui'))
+    uiWidget = slicer.util.loadUI(self.resourcePath('UI/dev.ui'))
     self.layout.addWidget(uiWidget)
     self.ui = slicer.util.childWidgetVariables(uiWidget)
 
@@ -75,9 +74,25 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     uiWidget.setMRMLScene(slicer.mrmlScene)
 
     # Create a new parameterNode (it stores user's node and parameter values choices in the scene)
-    self.logic = UltraSegLogic()
-
+    self.logic = devLogic()
     self.setParameterNode(self.logic.getParameterNode())
+
+    if not self._parameterNode.GetNodeReferenceID('Segmentation'):
+      segmentationNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode', 'Segmentation')
+      segmentationNode.CreateDefaultDisplayNodes()
+      segmentationNode.GetSegmentation().AddEmptySegment('nerve')
+      segmentationNode.GetSegmentation().AddEmptySegment('vessel')
+      self._parameterNode.SetNodeReferenceID("Segmentation", segmentationNode.GetID())
+    
+
+    if not self._parameterNode.GetNodeReferenceID('Prompt'):
+      promptNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode', 'Prompt')
+      promptNode.CreateDefaultDisplayNodes()
+      promptNode.GetSegmentation().AddEmptySegment('nerve')
+      promptNode.GetSegmentation().AddEmptySegment('vessel')
+      promptNode.GetDisplayNode().SetAllSegmentsVisibility2DFill(False)
+      self._parameterNode.SetNodeReferenceID("Prompt", promptNode.GetID())
+    
 
     # Connections
 
@@ -87,14 +102,34 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     lastModelPath = self.logic.getLastModelPath()
     if lastModelPath is not None:
       self.ui.modelPathLineEdit.setCurrentPath(lastModelPath)
+
+    self.ui.checkBox_unext.connect('stateChanged(int)', self.onUnextChecked)
+    self.ui.checkBox_sam.connect('stateChanged(int)', self.onSAMChecked)
+    
     self.ui.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onInputImageSelected)
     self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputImageSelected)
+    # self.ui.browserSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onBrowserSelected)
     # self.ui.outputTransformComboBox.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputTransformSelected)
 
     self.ui.applyButton.connect('toggled(bool)', self.onApplyButton)
+    # self.ui.applyButton.enabled = False
+    # self.ui.embeddingButton.connect('clicked(bool)', self.onEmbeddingButton)
+
+    self.ui.SegmentEditorWidget.setMRMLSegmentEditorNode(slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentEditorNode', 'MySegmentEditor'))
+    self.ui.SegmentEditorWidget.setSegmentationNode(slicer.util.getNode('Prompt'))
+    # self.ui.SegmentEditorWidget.setActiveEffectByName('Scissors')
+    effect = self.ui.SegmentEditorWidget.effectByName('Scissors')
+    effect.setOperation(2)
+    effect.setShape(2)
 
     # Initial GUI update
     self.updateGUIFromParameterNode()
+
+    self.logic.connections = UtilConnections()
+    self.logic.connections.setup()
+
+    self.logic.setModel('sam')
+
 
   def onSceneImportEnd(self, caller, event):
     parameterNode = self.logic.getParameterNode()
@@ -110,11 +145,34 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # slicer.util.setApplicationLogoVisible(True)
     # slicer.util.setDataProbeVisible(True)
 
+  def onUnextChecked(self, checked):
+    if checked==2:
+      self.ui.checkBox_sam.blockSignals(True)
+      self.ui.checkBox_sam.setCheckState(0)
+      self.ui.checkBox_sam.blockSignals(False)
+      self.ui.modelPathLineEdit.enabled = True
+      # self.ui.embeddingButton.enabled = False
+      self.ui.SegmentEditorWidget.enabled = False
+      self.logic.setModel('unext')
+
+  def onSAMChecked(self, checked):
+    if checked==2:
+      self.ui.checkBox_unext.blockSignals(True)
+      self.ui.checkBox_unext.setCheckState(0)
+      self.ui.checkBox_unext.blockSignals(False)
+      self.ui.modelPathLineEdit.enabled = False
+      self.ui.SegmentEditorWidget.enabled = True
+      self.logic.setModel('sam')
+
   def onInputImageSelected(self, selectedNode):
     self.logic.setInputImage(selectedNode)
+    self.ui.SegmentEditorWidget.setSourceVolumeNode(selectedNode)
 
   def onOutputImageSelected(self, selectedNode):
     self.logic.setOutputImage(selectedNode)
+
+  def onBrowserSelected(self, selectedNode):
+    self.logic.setBrowser(selectedNode)
 
   # def onOutputTransformSelected(self, selectedNode):
   #   self.logic.setOutputTransform(selectedNode)
@@ -128,6 +186,8 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     Called when the application closes and the module widget is destroyed.
     """
     self.removeObservers()
+    if self.logic.connections:
+        self.logic.connections.clear()
 
   def setParameterNode(self, inputParameterNode):
     """
@@ -172,6 +232,7 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     self.ui.inputSelector.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.INPUT_IMAGE))
     self.ui.outputSelector.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.OUTPUT_IMAGE))
+    # self.ui.browserSelector.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.SEQUENCE_BROWSER))
     # self.ui.outputTransformComboBox.setCurrentNode(self._parameterNode.GetNodeReference(self.logic.OUTPUT_TRANSFORM))
 
     self.ui.applyButton.checked = self.logic.getPredictionActive()
@@ -199,6 +260,15 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     else:
       self.ui.feedbackLabel.text = "Prediction stopped"
 
+  def onEmbeddingButton(self):
+    try:
+      self.logic.computeEmbedding()
+      self.ui.applyButton.enabled = True
+    except Exception as e:
+      slicer.util.errorDisplay("Failed to compute embedding: "+str(e))
+      import traceback
+      traceback.print_exc()
+      
   def onApplyButton(self, toggled):
     """
     Run processing when user clicks "Apply" button.
@@ -219,17 +289,20 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     else:
       logging.info("Output image: {}".format(self.outputImageNode.GetName()))
 
-    if self.logic.unet_model is None:
-      self.ui.feedbackLabel.text = "UNet model not selected!"
-      logging.info("Apply button clicked without UNet model selected")
-      return
-    else:
-      logging.info("Using UNet")
+
+    if self.ui.modelPathLineEdit.enabled:
+      if self.logic.unext_model is None:
+        self.ui.feedbackLabel.text = "UNext model not selected!"
+        logging.info("Apply button clicked without UNext model selected")
+        return
+      else:
+        logging.info("Using UNext")
 
     try:
       if toggled:
         self.ui.inputSelector.enabled = False
         self.ui.outputSelector.enabled = False
+        # self.ui.browserSelector.enabled = False
         # self.ui.outputTransformComboBox.enabled = False
         self.addObserver(self.outputImageNode, slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent, self.onOutputModified)
         self.ui.feedbackLabel.text = "Prediction starting"
@@ -237,6 +310,7 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.removeObserver(self.outputImageNode, slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent, self.onOutputModified)
         self.ui.inputSelector.enabled = True
         self.ui.outputSelector.enabled = True
+        # self.ui.browserSelector.enabled = True
         # self.ui.outputTransformComboBox.enabled = True
         self.ui.feedbackLabel.text = "Prediction stopped"
 
@@ -249,10 +323,10 @@ class UltraSegWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
 
 #
-# UltraSegLogic
+# devLogic
 #
 
-class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
+class devLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
   """This class should implement all the actual
   computation done by your module.  The interface
   should be such that other python code can import
@@ -269,7 +343,8 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
   PREDICTION_ACTIVE = "PredictionActive"
   WAIT_FOR_NODE = "WaitForNode"  # Experimental idea: drop predictions until e.g. volume reconstruction output is updated
   AI_MODEL_FULLPATH = "AiModelFullpath"
-  LAST_AI_MODEL_PATH_SETTING = "UltraSeg/LastAiModelPath"
+  LAST_AI_MODEL_PATH_SETTING = "dev/LastAiModelPath"
+  SEQUENCE_BROWSER = 'SequenceBrowser'
 
   def __init__(self):
     ScriptedLoadableModuleLogic.__init__(self)
@@ -278,7 +353,7 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     self.slicer_to_model_scaling = None
     self.model_to_slicer_scaling = None
 
-    self.unet_model = None
+    self.unext_model = None
     self.apply_logarithmic_transformation = True
     self.logarithmic_transformation_decimals = 4
 
@@ -290,11 +365,10 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     self.predictionPaused = False
 
-    self.vesselLabelNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', 'Vessel')
-    self.nerveLabelNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', 'Nerve')
-    self.segmentationNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentationNode', 'UltraSoundSegmentation')
-    self.segmentationNode.GetSegmentation().AddEmptySegment('nerve')
-    self.segmentationNode.GetSegmentation().AddEmptySegment('vessel')
+    self.connections = None
+
+    self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+
 
   def setDefaultParameters(self, parameterNode):
     if not parameterNode.GetParameter(self.OUTPUT_FPS):
@@ -322,6 +396,10 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       parameterNode.SetNodeReferenceID(self.WAIT_FOR_NODE, selectedNode.GetID())
     self.waitForNodeLastMTime = 0  # Use output in first round
 
+  def setModel(self, model):
+    parameterNode = self.getParameterNode()
+    parameterNode.SetParameter('model', model)
+
   def setInputImage(self, inputImageNode):
     """
     Sets input image node
@@ -347,12 +425,12 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       return
     paramterNode.SetNodeReferenceID(self.OUTPUT_IMAGE, outputImageNode.GetID())
 
-  # def setOutputTransform(self, selectedNode):
-  #   parameterNode = self.getParameterNode()
-  #   if selectedNode is None:
-  #     parameterNode.SetNodeReferenceID(self.OUTPUT_TRANSFORM, None)
-  #     return
-  #   parameterNode.SetNodeReferenceID(self.OUTPUT_TRANSFORM, selectedNode.GetID())
+  def setBrowser(self, browserNode):
+    paramterNode = self.getParameterNode()
+    if browserNode is None:
+      paramterNode.SetNodeReferenceID(self.SEQUENCE_BROWSER, None)
+      return
+    paramterNode.SetNodeReferenceID(self.SEQUENCE_BROWSER, browserNode.GetID())
 
   def setModelPath(self, modelFullpath):
     """
@@ -367,18 +445,25 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     parameterNode.SetParameter(self.AI_MODEL_FULLPATH, modelFullpath)
 
     try:
-      model = UNet(n_channels=1, n_classes=3).cuda()
+      cudnn.benchmark = True
+      model = UNext(num_classes=2).cuda()
       checkpoint = torch.load(modelFullpath)
       model.load_state_dict(checkpoint)
       model.eval()
-      self.unet_model = model
-      logging.info(self.unet_model)
+      self.unext_model = model
+      logging.info(self.unext_model)
       logging.info("Model loaded from file: {}".format(modelFullpath))
       settings = qt.QSettings()
       settings.setValue(self.LAST_AI_MODEL_PATH_SETTING, modelFullpath)
     except Exception as e:
       logging.error("Could not load model from file: {}".format(modelFullpath))
       logging.error("Exception: {}".format(str(e)))
+
+  def getBox(self, mask):
+      non_zero = np.nonzero(mask)
+      x1, x2, y1, y2 = np.min(non_zero[1]), np.max(non_zero[1]), np.min(non_zero[0]), np.max(non_zero[0])
+      return np.array([x1,y1,x2,y2], dtype=int)
+
 
   def setRealTimePrediction(self, toggled):
     inputImageNode = self.getParameterNode().GetNodeReference(self.INPUT_IMAGE)
@@ -387,30 +472,57 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       logging.error("Cannot start live prediction, input image not specified")
       return
 
-    if self.unet_model is None:
-      logging.error("Cannot start live prediction, AI model is missing")
-      return
-
     if toggled == True:
+      if self.getParameterNode().GetParameter('model') == 'sam':
+        promptNode = self.getParameterNode().GetNodeReference('Prompt')
+        labelmapVolumeNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLLabelMapVolumeNode', 'label')
+        str_arr = vtk.vtkStringArray()
+        str_arr.InsertNextValue('vessel')
+        slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(promptNode, str_arr, labelmapVolumeNode, inputImageNode)
+        mask = slicer.util.arrayFromVolume(labelmapVolumeNode)
+        mask = mask.squeeze()[::-1, :]
+        # print(mask.shape)
+        self.vessel_box = self.getBox(mask)
 
-      input_array = slicer.util.array(inputImageNode.GetID())  # (Z, F, M)
-      input_array = input_array[0, :, :]  # (F, M)
+        str_arr = vtk.vtkStringArray()
+        str_arr.InsertNextValue('nerve')
+        slicer.modules.segmentations.logic().ExportSegmentsToLabelmapNode(promptNode, str_arr, labelmapVolumeNode, inputImageNode)
+        mask = slicer.util.arrayFromVolume(labelmapVolumeNode)
+        mask = mask.squeeze()[::-1, :]
+        self.nerve_box = self.getBox(mask)
 
-      # Start observing input image
+        input_array = np.squeeze(slicer.util.array(inputImageNode.GetID())).astype(np.uint8)
+        input_array = cv2.cvtColor(input_array, cv2.COLOR_GRAY2RGB)
+        self.connections.sendCmd({'msg': 'initialize', 'img': input_array[::-1, :], 'prompt': np.array([self.nerve_box, self.vessel_box])})
+        self.connections.recv()
+
+        promptNode.SetDisplayVisibility(False)
+
 
       self.predictionPaused = False
       self.inputModifiedObserverTag = inputImageNode.AddObserver(slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent,
                                                                  self.onInputNodeModified)
+      
       self.onInputNodeModified(None, None)  # Compute prediction for current image instead of waiting for an update
-      # slicer.app.layoutManager().sliceWidget('Yellow').sliceLogic().GetSliceCompositeNode().SetBackgroundVolumeID(outputImageNode.GetID())
-      # slicer.app.layoutManager().sliceWidget("Yellow").mrmlSliceNode().SetOrientation('Axial')
-      # slicer.app.layoutManager().sliceWidget("Yellow").sliceController().fitSliceToBackground()
 
     else:
       logging.info("Stopping live segmentation")
       if self.inputModifiedObserverTag is not None:
         inputImageNode.RemoveObserver(self.inputModifiedObserverTag)
         self.inputModifiedObserverTag = None
+
+  def computeEmbedding(self):
+    browserNode = self.getParameterNode().GetNodeReference(self.SEQUENCE_BROWSER)
+    seqenceNode = browserNode.GetSequenceNode(self.getParameterNode().GetNodeReference(self.INPUT_IMAGE))
+    img_size = slicer.util.arrayFromVolume(self.getParameterNode().GetNodeReference(self.INPUT_IMAGE)).shape[1:]
+    len_seq = seqenceNode.GetNumberOfDataNodes()
+    seq_data = np.zeros((len_seq, *img_size), dtype=np.uint8)
+    for i in range(len_seq):
+      seq_data[i,...] = np.squeeze(slicer.util.arrayFromVolume(seqenceNode.GetNthDataNode(i)))[::-1, :]
+    self.connections.sendCmd({'msg': 'compute embedding', 'data': seq_data})
+    msg = self.connections.recv()
+    logging.info(msg)
+
 
   def updateOutputFps(self):
     """Call this function exactly once per every output prediction generated."""
@@ -456,103 +568,84 @@ class UltraSegLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
   def updatePrecition(self):
     parameterNode = self.getParameterNode()
     inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
-    input_array = slicer.util.array(inputImageNode.GetID())
-    logging.debug(input_array.shape)
-    # input_array axis directions (Z, F, M):
-    # 1: out of plane = Z
-    # 2: sound direction = F
-    # 3: transducer mark direction = M
+    outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+    if parameterNode.GetParameter('model') == 'sam':
+      nerve_mask, vessel_mask = self.samPredict()
+    else:
+      nerve_mask, vessel_mask = self.unextPredict()
 
-    # input_image = Image.fromarray(input_array[0, :, :])  # image.width is M, image.height is F
-    # resized_input_array = np.array(  # np.array will be (F, M) again, but resize happens in (M, F) axis order
-    #   input_image.resize(
-    #     (
-    #       512, #int(input_image.width * self.slicer_to_model_scaling[1]),  # M direction (width on US machine)
-    #       512, #int(input_image.height * self.slicer_to_model_scaling[0]),  # F direction (height on US machine)
-    #     ),
-    #     resample=Image.BILINEAR
-    #   )
-    # )
-    # resized_input_array = np.flip(resized_input_array, axis=0)  # Flip to trained sound direction
-    # resized_input_array = resized_input_array / resized_input_array.max()  # Scaling intensity to 0-1
-    # resized_input_array = np.expand_dims(resized_input_array, axis=0)  # Add Batch dimension
-    # resized_input_array = np.expand_dims(resized_input_array, axis=3)
-    input_tensor = torchvision.transforms.Compose([torchvision.transforms.Resize((512,512)), torchvision.transforms.ToTensor()])(Image.fromarray(input_array[0,:,:])).unsqueeze(0).cuda()
-    output_tensor = self.unet_model(input_tensor)
+    nerve_mask = find_max_region(nerve_mask)
+    vessel_mask = find_max_region(vessel_mask)
+    # segmentationNode = parameterNode.GetNodeReference('Segmentation')
+    # slicer.util.updateSegmentBinaryLabelmapFromArray(nerve_mask[::-1, :], segmentationNode, segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('nerve'), inputImageNode)
+    # slicer.util.updateSegmentBinaryLabelmapFromArray(vessel_mask[::-1, :], segmentationNode, segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('vessel'), inputImageNode)
 
-    # output_array = y[0, :, :, 1]  # Remove batch dimension (F, M)
-    # output_array = np.flip(output_array, axis=0)  # Flip back to match input sound direction
-
-    # apply_logarithmic_transformation = True
-    # logarithmic_transformation_decimals = 4
-    # if apply_logarithmic_transformation:
-    #   e = logarithmic_transformation_decimals
-    #   output_array = np.log10(np.clip(output_array, 10 ** (-e), 1.0) * (10 ** e)) / e
-    # output_image = Image.fromarray(output_array)  # F -> height, M -> width
-    # upscaled_output_array = np.array(
-    #   output_image.resize(
-    #     (
-    #       int(output_image.width * self.model_to_slicer_scaling[1]),
-    #       int(output_image.height * self.model_to_slicer_scaling[0]),
-    #     ),
-    #     resample=Image.BILINEAR,
-    #   )
-    # )
-    # upscaled_output_array = upscaled_output_array * 255
-    # upscaled_output_array = np.clip(upscaled_output_array, 0, 255)
-    # logging.debug(torch.unique(torch.argmax(output_tensor, dim=1)))
-    output_tensor[:,1:,...][output_tensor[:,1:,...]<0.99] = 0
-    output_cls = torch.argmax(output_tensor, dim=1).cpu().numpy().astype(np.uint8)
-    output_cls = np.asarray(Image.fromarray(output_cls[0,:,:]).resize((input_array.shape[2], input_array.shape[1]), resample=Image.BILINEAR))[np.newaxis,...]
-    # logging.debug(output_cls.shape)
-    output_array = input_array.copy()
-    output_array[output_cls==0] = 0
-    nerve_mask = (output_cls==1).astype(np.uint8)
-    vessel_mask = (output_cls==2).astype(np.uint8)
-    # logging.debug(np.unique(input_array))
-    # logging.debug('out')
-    # logging.debug(np.unique(output_array))
-    # if 127 in output_array:
-    #   logging.debug(np.unique(output_array))
-    #   Image.fromarray(output_array[0,:,:]).save('D:\\downloads\\test.png')
-    # output = Image.fromarray(output_array[0,:,:]).convert('L')
-    # logging.debug(output.getcolors())
-    # output_array[output_array==1] = 127
-    # output_array[output_array==2] = 255
-    # logging.debug(np.unique(output_array))
-
-
-    # VolumeIJKToRAS = vtk.vtkMatrix4x4()
-    # inputImageNode.GetIJKToRASMatrix(VolumeIJKToRAS)
-    # self.vesselLabelNode.SetIJKToRASMatrix(VolumeIJKToRAS)
-    # self.nerveLabelNode.SetIJKToRASMatrix(VolumeIJKToRAS)  
-
-    # slicer.util.updateVolumeFromArray(self.nerveLabelNode, nerve_mask)
-    # slicer.util.updateVolumeFromArray(self.vesselLabelNode, vessel_mask)
-    slicer.util.updateSegmentBinaryLabelmapFromArray(nerve_mask, self.segmentationNode, self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('nerve'), inputImageNode)
-    slicer.util.updateSegmentBinaryLabelmapFromArray(vessel_mask, self.segmentationNode, self.segmentationNode.GetSegmentation().GetSegmentIdBySegmentName('vessel'), inputImageNode)
-    # self.nerveSegNode.CreateClosedSurfaceRepresentation()
-    # outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
-    # slicer.util.updateVolumeFromArray(outputImageNode, upscaled_output_array.astype(np.uint8)[np.newaxis, ...])
-    # slicer.util.updateVolumeFromArray(outputImageNode, output_array)
-    # Update output transform, just to be compatible with running separate process
-
-    # inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
-    # imageTransformNode = inputImageNode.GetParentTransformNode()
-    # outputTransformNode = parameterNode.GetNodeReference(self.OUTPUT_TRANSFORM)
-    # if imageTransformNode is not None and outputTransformNode is not None:
-    #   inputTransformMatrix = vtk.vtkMatrix4x4()
-    #   imageTransformNode.GetMatrixTransformToWorld(inputTransformMatrix)
-    #   outputTransformNode.SetMatrixTransformToParent(inputTransformMatrix)
-
+    slicer.util.updateVolumeFromArray(outputImageNode, nerve_mask[::-1, :] + vessel_mask[::-1, :])
+    
     self.updateOutputFps()  # Update FPS data
 
+  def samPredict(self):
+    parameterNode = self.getParameterNode()
+    inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
+
+    # browserNode = parameterNode.GetNodeReference(self.SEQUENCE_BROWSER)
+    # seq_num = browserNode.GetSelectedItemNumber()
+    # nerve_box = self.nerve_kf.predict(self.nerve_box)
+    # vessel_box = self.vessel_kf.predict(self.vessel_box)
+    # print(nerve_box, vessel_box)
+    # self.connections.sendCmd({'msg': 'predict', 'seq_num': seq_num, 'boxes': np.array([nerve_box[:4], vessel_box[:4]])})
+    # nerve_mask, vessel_mask = self.connections.recv()
+    # self.nerve_box = self.getBox(nerve_mask)
+    # self.vessel_box = self.getBox(vessel_mask)
+
+    input_array = np.squeeze(slicer.util.array(inputImageNode.GetID())).astype(np.uint8)
+    input_array = cv2.cvtColor(input_array, cv2.COLOR_GRAY2RGB)
+    self.connections.sendCmd({'msg': 'track', 'img': input_array[::-1, :]})
+    nerve_mask, vessel_mask = self.connections.recv()
+
+    return nerve_mask, vessel_mask
+
+  def unextPredict(self):
+    parameterNode = self.getParameterNode()
+    inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
+    input_array = np.squeeze(slicer.util.array(inputImageNode.GetID())).astype(np.uint8)
+    input_array = self.clahe.apply(input_array)
+    input_array = cv2.cvtColor(input_array, cv2.COLOR_GRAY2RGB)
+    input_size = input_array.shape[:2][::-1]
+    input_array = cv2.resize(input_array, (512, 512), interpolation=cv2.INTER_LINEAR)
+    input_tensor = torch.Tensor(input_array.transpose(2,0,1) / 255).cuda()
+    with torch.no_grad():
+      output = self.unext_model(input_tensor[None,...])
+      output = torch.sigmoid(output.squeeze()).cpu().numpy()
+      output[output>=0.5]=1
+      output[output<0.5]=0
+      output = output.astype(np.uint8)
+    output = cv2.resize(output.transpose(1,2,0), input_size, interpolation=cv2.INTER_NEAREST).transpose(2,0,1)
+    nerve_mask, vessel_mask = output[0], output[1]
+    return nerve_mask[::-1,:], vessel_mask[::-1,:]
+  
+
+def find_max_region(mask_sel):
+    mask_sel = np.ascontiguousarray(mask_sel)
+    contours, _ = cv2.findContours(mask_sel,cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+
+    area = []
+
+    for j in range(len(contours)):
+        area.append(cv2.contourArea(contours[j]))
+    if len(area) >= 1:
+      max_idx = np.argmax(area)
+    
+      for k in range(len(contours)):
+          if k != max_idx:
+              cv2.fillPoly(mask_sel, [contours[k]], 0)
+    return mask_sel
 
 #
-# UltraSegTest
+# devTest
 #
 
-class UltraSegTest(ScriptedLoadableModuleTest):
+class devTest(ScriptedLoadableModuleTest):
   """
   This is the test case for your scripted module.
   Uses ScriptedLoadableModuleTest base class, available at:
@@ -568,9 +661,9 @@ class UltraSegTest(ScriptedLoadableModuleTest):
     """Run as few or as many tests as needed here.
     """
     self.setUp()
-    self.test_UltraSeg1()
+    self.test_dev1()
 
-  def test_UltraSeg1(self):
+  def test_dev1(self):
     """ Ideally you should have several levels of tests.  At the lowest level
     tests should exercise the functionality of the logic with different inputs
     (both valid and invalid).  At higher levels your tests should emulate the
